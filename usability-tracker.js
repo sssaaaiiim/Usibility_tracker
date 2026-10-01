@@ -1,0 +1,420 @@
+/**
+ * Usability Tracker v2
+ * Captures usability signals: clicks, rage/dead clicks, scroll depth, mouse movement,
+ * form friction, JS errors, and time on page. Includes a heatmap renderer and summary report.
+ *
+ * Optional config (define BEFORE loading this script):
+ *   window.UsabilityTrackerConfig = { endpoint: '/api/ux-logs', debug: true };
+ *
+ * Privacy: form values and keystrokes are never recorded. Add data-ut-ignore to any
+ * element to skip it entirely, or data-ut-mask to hide its text label.
+ */
+(function () {
+  'use strict';
+  if (window.UsabilityTracker) return;
+
+  const CONFIG = Object.assign({
+    endpoint: null,            // if set, logs are sent in batches via sendBeacon
+    flushIntervalMs: 15000,
+    maxEvents: 5000,           // in-memory cap (oldest events dropped)
+    moveSampleMs: 200,
+    scrollSampleMs: 150,
+    rageClickCount: 3,         // clicks...
+    rageClickWindowMs: 700,    // ...within this time...
+    rageClickRadiusPx: 30,     // ...and this distance
+    deadClickWaitMs: 600,      // wait for a visible reaction before calling it "dead"
+    scrollMilestones: [25, 50, 75, 100],
+    ignoreSelector: '[data-ut-ignore]',
+    maskSelector: '[data-ut-mask]',
+    debug: false
+  }, window.UsabilityTrackerConfig || {});
+
+  const SESSION_ID = (window.crypto && crypto.randomUUID)
+    ? crypto.randomUUID()
+    : 'session_' + Math.random().toString(36).slice(2, 11);
+
+  const logs = [];
+  const unsent = [];
+
+  // ---------- Helpers ----------
+  const INTERACTIVE_SELECTOR =
+    'a[href],button,input,select,textarea,label,summary,[role=button],[role=link],' +
+    '[role=tab],[role=menuitem],[role=checkbox],[role=switch],[onclick],[tabindex]';
+
+  function log(type, data) {
+    const entry = Object.assign({
+      sessionId: SESSION_ID,
+      type: type,
+      ts: Date.now(),
+      t: Math.round(performance.now()),
+      path: location.pathname + location.hash
+    }, data);
+
+    if (logs.length >= CONFIG.maxEvents) logs.splice(0, 500);
+    logs.push(entry);
+    if (CONFIG.endpoint) unsent.push(entry);
+    if (CONFIG.debug) console.log('[UsabilityTracker]', type, entry);
+    return entry;
+  }
+
+  function shouldIgnore(el) {
+    return !(el instanceof Element) || !!el.closest(CONFIG.ignoreSelector);
+  }
+
+  function docSize() {
+    const d = document.documentElement, b = document.body || d;
+    return {
+      w: Math.max(d.scrollWidth, b.scrollWidth, d.clientWidth),
+      h: Math.max(d.scrollHeight, b.scrollHeight, d.clientHeight)
+    };
+  }
+
+  function pageCoords(e) {
+    return {
+      x: Math.round(e.clientX + (window.pageXOffset || document.documentElement.scrollLeft)),
+      y: Math.round(e.clientY + (window.pageYOffset || document.documentElement.scrollTop))
+    };
+  }
+
+  // Short, readable CSS path that survives across sessions (for grouping clicks by element)
+  function getSelector(el) {
+    const parts = [];
+    while (el && el.nodeType === 1 && parts.length < 5) {
+      if (el.id) { parts.unshift('#' + CSS.escape(el.id)); break; }
+      let part = el.tagName.toLowerCase();
+      const cls = typeof el.className === 'string'
+        ? el.className.trim().split(/\s+/).filter(Boolean).slice(0, 2) : [];
+      if (cls.length) part += '.' + cls.map(c => CSS.escape(c)).join('.');
+      const parent = el.parentElement;
+      if (parent) {
+        const same = Array.from(parent.children).filter(c => c.tagName === el.tagName);
+        if (same.length > 1) part += ':nth-of-type(' + (same.indexOf(el) + 1) + ')';
+      }
+      parts.unshift(part);
+      el = parent;
+    }
+    return parts.join(' > ');
+  }
+
+  // Human-readable label, never exposing typed values
+  function getLabel(el) {
+    if (el.closest(CONFIG.maskSelector)) return '[masked]';
+    if (el.matches('input,textarea,select,[contenteditable]')) {
+      return el.getAttribute('aria-label') || el.name || el.placeholder || el.type || el.tagName.toLowerCase();
+    }
+    const text = el.getAttribute('aria-label') || el.innerText || el.textContent || '';
+    return text.trim().replace(/\s+/g, ' ').slice(0, 40);
+  }
+
+  // ---------- Page view lifecycle ----------
+  let pageStart, maxScroll, hitMilestones, activeTotal, activeSince, currentUrl;
+
+  function startPageView(initial) {
+    currentUrl = location.href;
+    pageStart = performance.now();
+    maxScroll = 0;
+    hitMilestones = new Set();
+    activeTotal = 0;
+    activeSince = document.hidden ? null : performance.now();
+    const s = docSize();
+    log('pageview', {
+      title: document.title,
+      referrer: initial ? document.referrer : null,
+      vw: window.innerWidth, vh: window.innerHeight,
+      docW: s.w, docH: s.h,
+      touch: 'ontouchstart' in window || navigator.maxTouchPoints > 0
+    });
+    onScroll(true);
+  }
+
+  function activeTime() {
+    return Math.round(activeTotal + (activeSince ? performance.now() - activeSince : 0));
+  }
+
+  function endPageView() {
+    log('page_leave', {
+      durationMs: Math.round(performance.now() - pageStart),
+      activeMs: activeTime(),
+      maxScrollPct: maxScroll
+    });
+  }
+
+  function onRouteChange() {
+    if (location.href === currentUrl) return;
+    endPageView();
+    startPageView(false);
+  }
+
+  ['pushState', 'replaceState'].forEach(function (m) {
+    const orig = history[m];
+    history[m] = function () {
+      const r = orig.apply(this, arguments);
+      onRouteChange();
+      return r;
+    };
+  });
+  window.addEventListener('popstate', onRouteChange);
+  window.addEventListener('hashchange', onRouteChange);
+
+  document.addEventListener('visibilitychange', function () {
+    if (document.hidden) {
+      if (activeSince) { activeTotal += performance.now() - activeSince; activeSince = null; }
+      log('visibility', { state: 'hidden' });
+      flush();
+    } else {
+      activeSince = performance.now();
+      log('visibility', { state: 'visible' });
+    }
+  });
+
+  // ---------- Clicks, rage clicks, dead clicks ----------
+  let recentClicks = [];
+
+  function detectRageClick(x, y, el) {
+    const now = performance.now();
+    recentClicks = recentClicks.filter(c => now - c.t < CONFIG.rageClickWindowMs);
+    recentClicks.push({ t: now, x: x, y: y });
+    const cluster = recentClicks.filter(c =>
+      Math.hypot(c.x - x, c.y - y) <= CONFIG.rageClickRadiusPx);
+    if (cluster.length >= CONFIG.rageClickCount) {
+      log('rage_click', { x: x, y: y, clicks: cluster.length, selector: getSelector(el), label: getLabel(el) });
+      recentClicks = [];
+    }
+  }
+
+  // A click on a non-interactive element that causes no DOM change or navigation
+  function detectDeadClick(el, x, y) {
+    if (window.getSelection && String(window.getSelection()).length) return; // user was selecting text
+    let changed = false;
+    const startUrl = location.href;
+    const mo = new MutationObserver(function () { changed = true; });
+    mo.observe(document.documentElement, { subtree: true, childList: true, attributes: true, characterData: true });
+    setTimeout(function () {
+      mo.disconnect();
+      if (!changed && location.href === startUrl) {
+        log('dead_click', { x: x, y: y, selector: getSelector(el), label: getLabel(el) });
+      }
+    }, CONFIG.deadClickWaitMs);
+  }
+
+  document.addEventListener('click', function (e) {
+    const el = e.target;
+    if (shouldIgnore(el)) return;
+
+    const interactive = !!el.closest(INTERACTIVE_SELECTOR);
+    const pointer = e.detail !== 0; // detail 0 = keyboard-triggered click
+    const base = {
+      selector: getSelector(el),
+      tag: el.tagName,
+      label: getLabel(el),
+      interactive: interactive,
+      input: pointer ? 'pointer' : 'keyboard'
+    };
+
+    if (!pointer) { log('click', base); return; }
+
+    const c = pageCoords(e);
+    const r = el.getBoundingClientRect();
+    const s = docSize();
+    log('click', Object.assign(base, {
+      x: c.x, y: c.y,
+      relX: r.width ? +((e.clientX - r.left) / r.width).toFixed(3) : null, // position inside element
+      relY: r.height ? +((e.clientY - r.top) / r.height).toFixed(3) : null,
+      docW: s.w, docH: s.h,
+      vw: window.innerWidth, vh: window.innerHeight
+    }));
+
+    detectRageClick(c.x, c.y, el);
+    if (!interactive) detectDeadClick(el, c.x, c.y);
+  }, true);
+
+  // ---------- Mouse movement (sampled) ----------
+  let lastMove = 0;
+  document.addEventListener('mousemove', function (e) {
+    const now = performance.now();
+    if (now - lastMove < CONFIG.moveSampleMs) return;
+    lastMove = now;
+    const c = pageCoords(e);
+    log('mousemove', { x: c.x, y: c.y });
+  }, { passive: true });
+
+  // ---------- Scroll depth ----------
+  let lastScroll = 0;
+  function onScroll(force) {
+    const now = performance.now();
+    if (force !== true && now - lastScroll < CONFIG.scrollSampleMs) return;
+    lastScroll = now;
+    const top = window.pageYOffset || document.documentElement.scrollTop;
+    const pct = Math.min(100, Math.round(((top + window.innerHeight) / docSize().h) * 100));
+    if (pct > maxScroll) maxScroll = pct;
+    CONFIG.scrollMilestones.forEach(function (m) {
+      if (maxScroll >= m && !hitMilestones.has(m)) {
+        hitMilestones.add(m);
+        log('scroll_depth', { depthPct: m, timeOnPageMs: Math.round(now - pageStart) });
+      }
+    });
+  }
+  window.addEventListener('scroll', onScroll, { passive: true });
+
+  // ---------- Form friction (never records values) ----------
+  const fieldFocus = new WeakMap();
+  const FIELD_SELECTOR = 'input,select,textarea';
+
+  document.addEventListener('focusin', function (e) {
+    if (e.target.matches && e.target.matches(FIELD_SELECTOR) && !shouldIgnore(e.target)) {
+      fieldFocus.set(e.target, { start: performance.now(), changed: false });
+    }
+  });
+  document.addEventListener('change', function (e) {
+    const f = fieldFocus.get(e.target);
+    if (f) f.changed = true;
+  });
+  document.addEventListener('focusout', function (e) {
+    const f = fieldFocus.get(e.target);
+    if (!f) return;
+    fieldFocus.delete(e.target);
+    log('field_interaction', {
+      selector: getSelector(e.target),
+      label: getLabel(e.target),
+      dwellMs: Math.round(performance.now() - f.start),
+      changed: f.changed
+    });
+  });
+  document.addEventListener('invalid', function (e) {
+    if (shouldIgnore(e.target)) return;
+    const v = e.target.validity, reasons = [];
+    for (const k in v) { if (v[k] === true && k !== 'valid') reasons.push(k); }
+    log('validation_error', { selector: getSelector(e.target), label: getLabel(e.target), reasons: reasons });
+  }, true);
+  document.addEventListener('submit', function (e) {
+    if (shouldIgnore(e.target)) return;
+    log('form_submit', { selector: getSelector(e.target) });
+  }, true);
+
+  // ---------- Errors users run into ----------
+  window.addEventListener('error', function (e) {
+    log('js_error', {
+      message: String(e.message || '').slice(0, 200),
+      source: e.filename || null, line: e.lineno || null, col: e.colno || null
+    });
+  });
+  window.addEventListener('unhandledrejection', function (e) {
+    log('js_error', { message: String((e.reason && e.reason.message) || e.reason || 'Unhandled rejection').slice(0, 200) });
+  });
+
+  // ---------- Viewport changes ----------
+  let resizeTimer;
+  window.addEventListener('resize', function () {
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(function () {
+      log('viewport', { vw: window.innerWidth, vh: window.innerHeight });
+    }, 300);
+  });
+
+  // ---------- Delivery ----------
+  function flush() {
+    if (!CONFIG.endpoint || !unsent.length) return;
+    const batch = unsent.splice(0, unsent.length);
+    const body = JSON.stringify({ sessionId: SESSION_ID, events: batch });
+    let ok = false;
+    try {
+      ok = navigator.sendBeacon && navigator.sendBeacon(CONFIG.endpoint, body);
+    } catch (_) { /* fall through */ }
+    if (!ok) unsent.unshift.apply(unsent, batch); // retry next flush
+  }
+  if (CONFIG.endpoint) setInterval(flush, CONFIG.flushIntervalMs);
+  window.addEventListener('pagehide', function () { endPageView(); flush(); });
+
+  // ---------- Analysis ----------
+  function topCounts(entries, key, n) {
+    const m = {};
+    entries.forEach(e => { m[e[key]] = (m[e[key]] || 0) + 1; });
+    return Object.keys(m).map(k => ({ selector: k, count: m[k] }))
+      .sort((a, b) => b.count - a.count).slice(0, n);
+  }
+
+  function getSummary() {
+    const by = t => logs.filter(e => e.type === t);
+    const fields = {};
+    by('field_interaction').forEach(e => {
+      const f = fields[e.selector] || (fields[e.selector] = { selector: e.selector, label: e.label, total: 0, n: 0 });
+      f.total += e.dwellMs; f.n++;
+    });
+    return {
+      sessionId: SESSION_ID,
+      pageviews: by('pageview').length,
+      clicks: by('click').length,
+      rageClicks: by('rage_click').length,
+      deadClicks: by('dead_click').length,
+      jsErrors: by('js_error').length,
+      validationErrors: by('validation_error').length,
+      maxScrollPct: maxScroll,
+      activeTimeMs: activeTime(),
+      topClicked: topCounts(by('click'), 'selector', 5),
+      topRageClicked: topCounts(by('rage_click'), 'selector', 5),
+      topDeadClicked: topCounts(by('dead_click'), 'selector', 5),
+      slowestFields: Object.keys(fields).map(k => ({
+        selector: fields[k].selector, label: fields[k].label,
+        avgDwellMs: Math.round(fields[k].total / fields[k].n)
+      })).sort((a, b) => b.avgDwellMs - a.avgDwellMs).slice(0, 5)
+    };
+  }
+
+  // ---------- Heatmap ----------
+  let heatCanvas = null;
+
+  /**
+   * Draws a heatmap overlay on the full page.
+   * @param {Object} opts - { type: 'click' | 'move' | 'rage_click' | 'dead_click', radius: 25 }
+   */
+  function renderHeatmap(opts) {
+    opts = opts || {};
+    const type = opts.type || 'click';
+    const radius = opts.radius || 25;
+    const colors = { click: '255,0,0', move: '0,120,255', rage_click: '255,140,0', dead_click: '160,0,200' };
+    const rgb = colors[type] || colors.click;
+    const eventType = type === 'move' ? 'mousemove' : type;
+
+    clearHeatmap();
+    const s = docSize();
+    const scale = Math.min(1, 4000 / Math.max(s.w, s.h)); // keep canvas memory sane
+    heatCanvas = document.createElement('canvas');
+    heatCanvas.setAttribute('data-ut-ignore', '');
+    heatCanvas.width = Math.round(s.w * scale);
+    heatCanvas.height = Math.round(s.h * scale);
+    Object.assign(heatCanvas.style, {
+      position: 'absolute', left: '0', top: '0',
+      width: s.w + 'px', height: s.h + 'px',
+      pointerEvents: 'none', zIndex: '2147483647'
+    });
+
+    const ctx = heatCanvas.getContext('2d');
+    logs.filter(e => e.type === eventType && e.x != null).forEach(function (e) {
+      const x = e.x * scale, y = e.y * scale, r = radius * scale;
+      const g = ctx.createRadialGradient(x, y, 0, x, y, r);
+      g.addColorStop(0, 'rgba(' + rgb + ',0.35)');
+      g.addColorStop(1, 'rgba(' + rgb + ',0)');
+      ctx.fillStyle = g;
+      ctx.fillRect(x - r, y - r, r * 2, r * 2);
+    });
+    document.body.appendChild(heatCanvas);
+  }
+
+  function clearHeatmap() {
+    if (heatCanvas && heatCanvas.parentNode) heatCanvas.parentNode.removeChild(heatCanvas);
+    heatCanvas = null;
+  }
+
+  // ---------- Public API ----------
+  window.UsabilityTracker = {
+    sessionId: SESSION_ID,
+    getLogs: function () { return logs.slice(); },
+    getSummary: getSummary,
+    exportJSON: function () { return JSON.stringify({ summary: getSummary(), events: logs }, null, 2); },
+    flush: flush,
+    renderHeatmap: renderHeatmap,
+    clearHeatmap: clearHeatmap
+  };
+
+  startPageView(true);
+})();
